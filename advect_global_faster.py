@@ -1,3 +1,4 @@
+#%%
 import numpy as np
 import datetime as dt
 import xarray as xr
@@ -6,23 +7,38 @@ from csat2 import ECMWF
 import warnings
 import os
 
-# initial domain
-lat_domain = np.arange(-60, 60, 0.25)
-lon_domain = np.arange(0, 360, 0.25)
+#%%
+
+# initial domain, just select -60 to 60 such that the poles are ignored due to issues with advection and retrieval noise here, note that we use lon in the range [0,360]
+resolution = 1 ## generally either 1 or 0.25
+lat_domain = np.arange(-60, 60+resolution, resolution)
+lon_domain = np.arange(0, 360, resolution)
 lon_grid, lat_grid = np.meshgrid(lon_domain, lat_domain)
 
-# initial and final times
+# initial and final times, try running so a year
 t0 = dt.datetime(2015, 1, 1, 0, 0)
-tf = dt.datetime(2016, 1, 1, 0, 0)
-dt_step = dt.timedelta(minutes=30)
+tf = dt.datetime(2015, 1, 4, 0, 0)
+
+
+#%%
+## this is the timestep of advection routine
+dt_step = dt.timedelta(minutes=60)
+
+#%% Given the timestep calculate the minmum LST accuracy threshold, such that we achieve global covergae
+lst_threshold = dt_step.total_seconds() / 3600   # in hours
+
 steps_total = int((tf - t0) / dt_step)
+#%%
 
 # Parcel advect duration (24h)
 advect_duration = dt.timedelta(hours=24)
 steps_per_traj = int(advect_duration / dt_step)
 
+#%% 
+
 # Initialize wind data 
 winddata = ECMWF.ERA5WindData(level="1000hPa", res="1grid", linear_interp="both")
+
 
 # function to calc lst
 def calculate_lst(time_utc, lon):
@@ -37,18 +53,22 @@ traj_lats = []                # same as above
 # Active parcels tracking: each entry is (traj_index, adv_step_index)
 active_parcels = []
 
-# Main loop over all UTC time steps
+# Main loop over all UTC time steps, this is the number of unique UTC time intervals at 30 minutes increments
 for step in range(steps_total):
     
     current_utc = t0 + step * dt_step
     print(current_utc)
 
-    # Identify parcels to initialize: only those where LST == ~6am plus/ minus 15 mins at their lon
+    # Identify parcels to initialize: only those where LST == ~6am plus/ minus half of the minumum temporal resolution
     lst_grid = calculate_lst(current_utc, lon_grid)
-    init_mask = (lst_grid >= 5.75) & (lst_grid < 6.25)
+
+    init_mask = (lst_grid >= 6 - lst_threshold/2) & (lst_grid <  6 + lst_threshold/2)
 
     init_lons = lon_grid[init_mask].flatten()
     init_lats = lat_grid[init_mask].flatten()
+    print(init_lons.min(),init_lons.max())
+    print(init_lats.min(),init_lats.max())
+
 
     # Initialize new trajectories for these parcels
     for lon_init, lat_init in zip(init_lons, init_lats):
@@ -179,3 +199,4 @@ output_path = os.path.join(output_dir, f"trajectories_{t0:%Y%m%d}_{tf:%Y%m%d}.nc
 # Save to netCDF
 ds.to_netcdf(output_path)
 print(f"Saved {output_path}")
+# %%
