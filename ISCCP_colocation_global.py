@@ -104,7 +104,8 @@ def colocate_trajectories_with_isccp_utc_loop(trajectories_file, collection='isc
                 lons = lons % 360
                 
                 # Colocate all active parcels at once using the granule's geolocate method
-                isccp_values = granule.geolocate(collection, product, varname,lons, lats).isel(cloud_irtype = 0) # select liquid water clouds
+                isccp_values = granule.geolocate(collection, product, varname,lons, lats).isel(cloud_irtype = 0).squeeze() # select liquid water clouds
+                print(isccp_values.shape)
                 
                 # Store results back in the output array
                 for i, (traj_idx, step_idx) in enumerate(zip(traj_indices, step_indices)):
@@ -259,13 +260,13 @@ def analyze_colocated_data(ds_colocated, output_file=None):
 if __name__ == "__main__":
     # Define file paths
     trajectory_file = "/disk1/Users/gjp23/outputs/traj_positions/global_analysis/trajectories_20160101_20160102.nc"
-    output_file = "/disk1/Users/gjp23/outputs/traj_positions/global_analysis/trajectories_isccp_colocated_one_days_2016.nc"
+    output_file = "/disk1/Users/gjp23/outputs/traj_positions/global_analysis/trajectories_isccp_colocated_20160101_20160102.nc"
     
     ds_colocated = colocate_trajectories_with_isccp_utc_loop(
             trajectories_file=trajectory_file,
             collection='isccp-basic',
             product='hgg',
-            varname='cldamt_irtype',  # 
+            varname='cldamt_irtypes',  # 
             dt_step_minutes=30
         )
     
