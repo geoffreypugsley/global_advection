@@ -1,289 +1,394 @@
 #%%
 
-
-from csat2.ISCCP import Granule
-import pandas as pd
 import numpy as np
 import xarray as xr
 from datetime import datetime, timedelta
-import calendar
+import pandas as pd
+from csat2.ISCCP import Granule
+import multiprocessing as mp
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import dask.array as da
+import dask
+from functools import partial
+import os
+import warnings
 
 #%%
+class OptimizedTrajectoryColocation:
+    """
+    parallelized trajectory-ISCCP colocation 
+    
 
-def colocate_trajectories_with_isccp_utc_loop(trajectories_file, collection='isccp-basic', 
-                                            product='hgg', varname = 'cldamt_irtypes', dt_step_minutes=30):
-    """
-    Colocate trajectory data with ISCCP data by looping over UTC times in 3-hourly steps.
-    For each UTC time, load ISCCP data once and colocate all active parcels.
-    
-    Parameters:
-    -----------
-    trajectories_file : str
-        Path to the trajectories netCDF file
-    collection : str
-        ISCCP collection ('isccp-basic' or 'isccp')
-    product : str
-        ISCCP product ('hgg', 'hgh', 'hgm')
-    varname : str
-        Variable name to extract from ISCCP data
-    dt_step_minutes : int
-        Time step in minutes for trajectory data
-        
-    Returns:
-    --------
-    ds_colocated : xarray.Dataset
-        Dataset with trajectory positions and colocated ISCCP data
     """
     
-    # Load trajectory data
-    ds_traj = xr.load_dataset(trajectories_file)
-    n_trajectories, n_steps = ds_traj.lon.shape
-    dt_step = timedelta(minutes=dt_step_minutes)
-    
-    # Initialize output array
-    isccp_data = np.full((n_trajectories, n_steps), np.nan)
-    
-    # Determine time range from trajectory data
-    start_times = ds_traj.start_time.values
-    earliest_start = np.min(start_times)
-    latest_start = np.max(start_times)
-    
-    # Convert to datetime objects
-    earliest_start_dt = np.datetime64(earliest_start).astype('datetime64[s]').astype(datetime)
-    latest_start_dt = np.datetime64(latest_start).astype('datetime64[s]').astype(datetime)
-    
-    # Calculate the full time range (latest start + max trajectory length)
-    max_trajectory_duration = timedelta(minutes=dt_step_minutes * (n_steps - 1))
-    end_time = latest_start_dt + max_trajectory_duration
-    
-    # Round start time down to nearest 3-hour boundary
-    start_hour = (earliest_start_dt.hour // 3) * 3
-    utc_start = earliest_start_dt.replace(hour=start_hour, minute=0, second=0, microsecond=0)
-    
-    # Round end time up to next 3-hour boundary
-    end_hour = ((end_time.hour // 3) + 1) * 3
-    if end_hour >= 24:
-        end_time = end_time.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
-    else:
-        end_time = end_time.replace(hour=end_hour, minute=0, second=0, microsecond=0)
-    
-    print(f"Processing ISCCP data from {utc_start} to {end_time}")
-    
-    # Main loop: iterate over UTC times in 3-hourly steps
-    current_utc = utc_start
-    utc_step = 0
-    
-    while current_utc <= end_time:
-        print(f"Processing UTC time: {current_utc} (step {utc_step})")
+    def __init__(self, trajectory_file, chunk_size=100000, n_workers=None):
+
+        self.trajectory_file = trajectory_file
+        self.chunk_size = chunk_size
+        self.n_workers = n_workers or max(1, mp.cpu_count() - 1)
         
-        # Convert to day of year for ISCCP granule
-        doy = current_utc.timetuple().tm_yday
+        print(f"Initializing with chunk_size={chunk_size:,}, n_workers={self.n_workers}")
         
-        # Create ISCCP granule
-        granule = Granule(current_utc.year, doy, current_utc.hour)
+     
+        with xr.open_dataset(trajectory_file) as ds:
+            self.n_trajectories = len(ds.trajectory)
+            self.n_steps = len(ds.step)
+            self.start_times = ds.start_time.values
+            
+        print(f"Dataset: {self.n_trajectories:,} trajectories × {self.n_steps} steps")
+        
+ 
+        self.time_lookup = self._build_time_lookup_table()
+        
+    def _build_time_lookup_table(self):
+        """
+        Pre-compute which ISCCP times each trajectory should be active for.
+        This eliminates the need for nested loops later.
+        """
+        print("Building time lookup table...")
+        
+        # Convert start times to datetime objects
+        start_times_dt = pd.to_datetime(self.start_times)
+        
+        # Determine time range
+        earliest = start_times_dt.min()
+        latest = start_times_dt.max() + pd.Timedelta(hours=24)  # Add max trajectory duration
+        
+        # Generate ISCCP times (3-hourly)
+        isccp_times = pd.date_range(
+            start=earliest.floor('3H'), 
+            end=latest.ceil('3H'), 
+            freq='3H'
+        )
+        
+        print(f"ISCCP time range: {isccp_times[0]} to {isccp_times[-1]} ({len(isccp_times)} time slots)")
+        
+        # For each ISCCP time, determine which trajectories are active
+        lookup = {}
+        
+        for i, isccp_time in enumerate(isccp_times):
+            # Find trajectories active at this time (within 24h of start)
+            time_since_start = (isccp_time - start_times_dt).total_seconds() / 3600  # hours
+            active_mask = (time_since_start >= 0) & (time_since_start <= 24)
+            active_traj_indices = np.where(active_mask)[0]
+            
+            if len(active_traj_indices) > 0:
+                # For each active trajectory, determine the closest time step
+                step_indices = np.round(time_since_start[active_mask]).astype(int)
+                step_indices = np.clip(step_indices, 0, self.n_steps - 1)
+                
+                lookup[isccp_time] = {
+                    'traj_indices': active_traj_indices,
+                    'step_indices': step_indices,
+                    'n_active': len(active_traj_indices)
+                }
+            
+            if (i + 1) % 100 == 0:
+                print(f"  Processed {i+1}/{len(isccp_times)} time slots")
+        
+        print(f"Time lookup table complete: {len(lookup)} active time slots")
+        return lookup
+    
+    def process_isccp_time_chunk(self, isccp_time, traj_chunk_start, traj_chunk_end):
+        """
+        Process a single ISCCP time for a chunk of trajectories.
+        This function can be parallelized.
+        """
+        if isccp_time not in self.time_lookup:
+            return None, None, None  # No active trajectories for this time
+        
+        lookup_data = self.time_lookup[isccp_time]
+        active_traj_indices = lookup_data['traj_indices']
+        step_indices = lookup_data['step_indices']
+        
+        # Filter for current chunk
+        chunk_mask = (active_traj_indices >= traj_chunk_start) & (active_traj_indices < traj_chunk_end)
+        if not np.any(chunk_mask):
+            return None, None, None
+        
+        chunk_traj_indices = active_traj_indices[chunk_mask] - traj_chunk_start  # Relative to chunk
+        chunk_step_indices = step_indices[chunk_mask]
+        global_traj_indices = active_traj_indices[chunk_mask]  # Global indices
+        
+        # Load trajectory chunk
+        with xr.open_dataset(self.trajectory_file) as ds:
+            chunk_lons = ds.lon.isel(trajectory=slice(traj_chunk_start, traj_chunk_end)).values
+            chunk_lats = ds.lat.isel(trajectory=slice(traj_chunk_start, traj_chunk_end)).values
+        
+        # Extract positions for active parcels
+        lons = chunk_lons[chunk_traj_indices, chunk_step_indices]
+        lats = chunk_lats[chunk_traj_indices, chunk_step_indices]
+        
+        # Filter out NaN positions
+        valid_mask = ~np.isnan(lons) & ~np.isnan(lats)
+        if not np.any(valid_mask):
+            return None, None, None
+        
+        lons = lons[valid_mask] % 360  # Ensure [0, 360]
+        lats = lats[valid_mask]
+        valid_global_traj = global_traj_indices[valid_mask]
+        valid_steps = chunk_step_indices[valid_mask]
+        
+        return lons, lats, (valid_global_traj, valid_steps)
+    
+    def colocate_isccp_time(self, isccp_time, collection='isccp-basic', 
+                           product='hgg', varname='cldamt_irtypes'):
+        """
+        Process all trajectory chunks for a single ISCCP time.
+        """
+        print(f"\nProcessing ISCCP time: {isccp_time}")
+        
+        if isccp_time not in self.time_lookup:
+            print("  No active trajectories")
+            return {}
+        
+        # Load ISCCP data once
+        try:
+            doy = isccp_time.timetuple().tm_yday
+            granule = Granule(isccp_time.year, doy, isccp_time.hour)
+            
+            if not granule.check(collection, product):
+                print(f"  Downloading ISCCP data...")
+                granule.download(collection, product)
+        except Exception as e:
+            print(f"  Error loading ISCCP data: {e}")
+            return {}
+        
+        # Collect all active parcels across chunks
+        all_lons, all_lats, all_indices = [], [], []
+        
+        n_chunks = (self.n_trajectories + self.chunk_size - 1) // self.chunk_size
+        
+        for chunk_idx in range(n_chunks):
+            start_idx = chunk_idx * self.chunk_size
+            end_idx = min(start_idx + self.chunk_size, self.n_trajectories)
+            
+            result = self.process_isccp_time_chunk(isccp_time, start_idx, end_idx)
+            lons, lats, indices = result
+            
+            if lons is not None:
+                all_lons.append(lons)
+                all_lats.append(lats)
+                all_indices.append(indices)
+        
+        if not all_lons:
+            print("  No valid parcels found")
+            return {}
+        
+        # Concatenate all parcels
+        final_lons = np.concatenate(all_lons)
+        final_lats = np.concatenate(all_lats)
+        final_traj_indices = np.concatenate([idx[0] for idx in all_indices])
+        final_step_indices = np.concatenate([idx[1] for idx in all_indices])
+        
+        print(f"  Colocating {len(final_lons):,} parcels...")
         
         try:
-            # Download ISCCP data if necessary
-            if not granule.check(collection, product):
-                print(f"  Downloading ISCCP data for {current_utc}")
-                granule.download(collection, product)
+            # Colocate with ISCCP (this is the expensive operation)
+            isccp_values = granule.geolocate(collection, product, varname, final_lons, final_lats)
             
-            # Find all trajectory points that are active at this UTC time
-            active_parcels = find_active_parcels_at_utc(ds_traj, current_utc)
+            if 'cloud_irtype' in isccp_values.dims:
+                isccp_values = isccp_values.isel(cloud_irtype=0).squeeze()
             
-            if len(active_parcels) > 0:
-                print(f"  Found {len(active_parcels)} active parcels")
-                
-                # Extract positions
-                traj_indices = [p['traj_idx'] for p in active_parcels]
-                step_indices = [p['step_idx'] for p in active_parcels]
-                lons = np.array([p['lon'] for p in active_parcels])
-                lats = np.array([p['lat'] for p in active_parcels])
-                
-                # Convert longitudes to [0, 360] range for ISCCP
-                lons = lons % 360
-                
-                # Colocate all active parcels at once using the granule's geolocate method
-                isccp_values = granule.geolocate(collection, product, varname,lons, lats).isel(cloud_irtype = 0).squeeze() # select liquid water clouds
-                print(isccp_values.shape)
-                
-                # Store results back in the output array
-                for i, (traj_idx, step_idx) in enumerate(zip(traj_indices, step_indices)):
-                    if hasattr(isccp_values, 'values'):
-                        isccp_data[traj_idx, step_idx] = isccp_values.values[i]
-                    else:
-                        isccp_data[traj_idx, step_idx] = isccp_values[i]
-                
-                print(f"  Colocated {len(active_parcels)} parcels successfully")
-            else:
-                print(f"  No active parcels found for this UTC time")
-                
+            # Return results as dictionary for easy merging
+            results = {}
+            for i, (traj_idx, step_idx) in enumerate(zip(final_traj_indices, final_step_indices)):
+                key = (int(traj_idx), int(step_idx))
+                value = isccp_values.values[i] if hasattr(isccp_values, 'values') else isccp_values[i]
+                results[key] = value
+            
+            print(f"  Successfully colocated {len(results):,} parcels")
+            return results
+            
         except Exception as e:
-            print(f"  Error processing ISCCP data for {current_utc}: {e}")
-        
-        # Move to next 3-hour step
-        current_utc += timedelta(hours=3)
-        utc_step += 1
+            print(f"  Error in ISCCP colocation: {e}")
+            return {}
     
-    # Create output dataset
-    ds_colocated = xr.Dataset(
-        data_vars=dict(
-            lon=(["trajectory", "step"], ds_traj.lon.values),
-            lat=(["trajectory", "step"], ds_traj.lat.values),
-            isccp_data=(["trajectory", "step"], isccp_data)
-        ),
-        coords=dict(
-            trajectory=np.arange(n_trajectories),
-            step=np.arange(n_steps),
-            start_time=("trajectory", ds_traj.start_time.values)
-        ),
-        attrs=dict(
-            isccp_collection=collection,
-            isccp_product=product,
-            isccp_variable=varname,
-            description=f"Trajectory data colocated with ISCCP {varname} data",
-            time_step_minutes=dt_step_minutes
-        )
+    def run_parallel_colocation(self, collection='isccp-basic', product='hgg', 
+                               varname='cldamt_irtypes', output_file=None):
+        """
+        Run colocation using parallel processing across ISCCP times.
+        """
+        print(f"\n{'='*60}")
+        print(f"STARTING PARALLEL COLOCATION")
+        print(f"{'='*60}")
+        
+        isccp_times = list(self.time_lookup.keys())
+        # Only take the first 2 ISCCP time slots
+        isccp_times = list(self.time_lookup.keys())[:2] ## this is purely for testing!
+        print(f"Processing {len(isccp_times)} ISCCP time slots using {self.n_workers} workers")
+        
+        # Initialize output array (memory mapped for efficiency)
+        if output_file:
+            temp_file = output_file.replace('.nc', '_temp.dat')
+            isccp_data = np.memmap(temp_file, dtype='float32', mode='w+', 
+                                  shape=(self.n_trajectories, self.n_steps))
+            isccp_data[:] = np.nan
+        else:
+            isccp_data = np.full((self.n_trajectories, self.n_steps), np.nan, dtype=np.float32)
+        
+        # Process ISCCP times in parallel
+        colocation_func = partial(self.colocate_isccp_time, 
+                                 collection=collection, product=product, varname=varname)
+        
+        completed = 0
+        with ProcessPoolExecutor(max_workers=self.n_workers) as executor:
+            # Submit all tasks
+            future_to_time = {executor.submit(colocation_func, time): time 
+                             for time in isccp_times}
+            
+            # Collect results as they complete
+            for future in as_completed(future_to_time):
+                isccp_time = future_to_time[future]
+                completed += 1
+                
+                try:
+                    results = future.result()
+                    
+                    # Store results in output array
+                    for (traj_idx, step_idx), value in results.items():
+                        isccp_data[traj_idx, step_idx] = value
+                    
+                    print(f"Completed {completed}/{len(isccp_times)}: {isccp_time} "
+                          f"({len(results):,} matches)")
+                    
+                except Exception as e:
+                    print(f"Error processing {isccp_time}: {e}")
+        
+        print(f"\n{'='*60}")
+        print(f"COLOCATION COMPLETE")
+        print(f"{'='*60}")
+        
+        # Create output dataset
+        ds_output = self._create_output_dataset(isccp_data, collection, product, varname)
+        
+        if output_file:
+            print(f"Saving results to {output_file}")
+            ds_output.to_netcdf(output_file, chunks={'trajectory': self.chunk_size})
+            
+            # Clean up memory mapped file
+            if isinstance(isccp_data, np.memmap):
+                del isccp_data
+                if os.path.exists(temp_file):
+                    os.remove(temp_file)
+        
+        return ds_output
+    
+    def _create_output_dataset(self, isccp_data, collection, product, varname):
+        """Create the final output dataset."""
+        
+        # Load trajectory coordinates (chunked)
+        with xr.open_dataset(self.trajectory_file, chunks={'trajectory': self.chunk_size}) as ds_traj:
+            ds_output = xr.Dataset(
+                data_vars=dict(
+                    lon=(["trajectory", "step"], ds_traj.lon.data),
+                    lat=(["trajectory", "step"], ds_traj.lat.data),
+                    isccp_data=(["trajectory", "step"], isccp_data)
+                ),
+                coords=dict(
+                    trajectory=ds_traj.trajectory,
+                    step=ds_traj.step,
+                    start_time=ds_traj.start_time
+                ),
+                attrs=dict(
+                    isccp_collection=collection,
+                    isccp_product=product,
+                    isccp_variable=varname,
+                    description=f"Optimized trajectory-ISCCP colocation",
+                    n_trajectories=self.n_trajectories,
+                    chunk_size=self.chunk_size,
+                    n_workers=self.n_workers
+                )
+            )
+        
+        # Add variable attributes
+        ds_output.isccp_data.attrs = {
+            'long_name': f'ISCCP {varname}',
+            'source': 'ISCCP',
+            'colocation_method': 'optimized_parallel'
+        }
+        
+        return ds_output
+
+
+def run_optimized_colocation(trajectory_file, output_file, 
+                           chunk_size=50000, n_workers=None,
+                           collection='isccp-basic', product='hgg', 
+                           varname='cldamt_irtypes'):
+    """
+    Main function to run optimized trajectory-ISCCP colocation.
+    
+    Memory usage estimate:
+    - chunk_size=50,000: ~12GB peak memory per worker
+    - chunk_size=100,000: ~24GB peak memory per worker
+    """
+    
+    print(f"Starting optimized colocation:")
+    print(f"  Input: {trajectory_file}")
+    print(f"  Output: {output_file}")
+    print(f"  Chunk size: {chunk_size:,}")
+    print(f"  Workers: {n_workers or 'auto'}")
+    
+    # Initialize colocation processor
+    processor = OptimizedTrajectoryColocation(
+        trajectory_file=trajectory_file,
+        chunk_size=chunk_size,
+        n_workers=n_workers
     )
     
-    # Add variable attributes
-    ds_colocated.lon.attrs = {'units': 'degrees_east', 'long_name': 'longitude'}
-    ds_colocated.lat.attrs = {'units': 'degrees_north', 'long_name': 'latitude'}
-    ds_colocated.isccp_data.attrs = {'long_name': f'ISCCP {varname}', 'source': 'ISCCP'}
+    # Run parallel colocation
+    ds_output = processor.run_parallel_colocation(
+        collection=collection,
+        product=product,
+        varname=varname,
+        output_file=output_file
+    )
     
-    return ds_colocated
+    # Analyze results
+    analyze_colocation_results(ds_output)
+    
+    return ds_output
 
 
-def find_active_parcels_at_utc(ds_traj, utc_time):
-    """
-    Find all trajectory points that are active at a given UTC time.
-    Active means: parcels initialized within 24 hours of the current UTC time,
-    at their current position at that UTC time.
+def analyze_colocation_results(ds):
+    """Quick analysis of colocation results."""
     
-    Parameters:
-    -----------
-    ds_traj : xarray.Dataset
-        Trajectory dataset with 'time' variable giving UTC time for each step
-    utc_time : datetime
-        UTC time to check
-        
-    Returns:
-    --------
-    active_parcels : list of dict
-        List of active parcel information with keys: 'traj_idx', 'step_idx', 'lon', 'lat'
-    """
+    isccp_data = ds.isccp_data.values
+    valid_data = isccp_data[~np.isnan(isccp_data)]
     
-    active_parcels = []
-    n_trajectories, n_steps = ds_traj.lon.shape
-    
-    # Convert utc_time to numpy datetime64 for comparison
-    utc_time_np = np.datetime64(utc_time)
-    time_24h_ago = utc_time_np - np.timedelta64(24, 'h')
-    
-    for traj_idx in range(n_trajectories):
-        # Check if this trajectory was initialized within the last 24 hours
-        start_time = ds_traj.start_time.values[traj_idx]
-        
-        if start_time >= time_24h_ago and start_time <= utc_time_np:
-            # This trajectory is "active" (initialized within last 24h)
-            # Now find the step that corresponds to the current UTC time
-            
-            for step_idx in range(n_steps):
-                # Check if this step has valid time and position data
-                step_time = ds_traj.time.values[traj_idx, step_idx]
-                
-                if not np.isnat(step_time):  # Check if time is not NaT (Not a Time)
-                    # Check if this step time matches our target UTC time
-                    # (allowing for some small tolerance due to discrete time steps)
-                    time_diff = abs((step_time - utc_time_np) / np.timedelta64(1, 'm'))  # difference in minutes
-                    
-                    if time_diff <= 90:  # Within 1.5 hours (for 3-hourly ISCCP matching)
-                        lon = ds_traj.lon.values[traj_idx, step_idx]
-                        lat = ds_traj.lat.values[traj_idx, step_idx]
-                        
-                        # Only include if position data is valid (not NaN)
-                        if not (np.isnan(lon) or np.isnan(lat)):
-                            active_parcels.append({
-                                'traj_idx': traj_idx,
-                                'step_idx': step_idx,
-                                'lon': lon,
-                                'lat': lat
-                            })
-                            break  # Found the right time step for this trajectory
-    
-    return active_parcels
-
-
-def analyze_colocated_data(ds_colocated, output_file=None):
-    """
-    Basic analysis of colocated trajectory-ISCCP data.
-    
-    Parameters:
-    -----------
-    ds_colocated : xarray.Dataset
-        Output from colocate_trajectories_with_isccp_utc_loop
-    output_file : str, optional
-        Path to save the colocated dataset
-    """
-    
-    if output_file:
-        ds_colocated.to_netcdf(output_file)
-        print(f"Saved colocated data to {output_file}")
-    
-    # Basic statistics
-    isccp_data = ds_colocated.isccp_data
-    valid_data = isccp_data.values[~np.isnan(isccp_data.values)]
-    
-    print("\n=== Colocation Summary ===")
-    print(f"Total trajectory points: {isccp_data.size}")
-    print(f"Valid ISCCP matches: {len(valid_data)}")
-    print(f"Match rate: {len(valid_data)/isccp_data.size*100:.1f}%")
+    print(f"\n{'='*40}")
+    print(f"COLOCATION RESULTS SUMMARY")
+    print(f"{'='*40}")
+    print(f"Total trajectory points: {isccp_data.size:,}")
+    print(f"Valid ISCCP matches: {len(valid_data):,}")
+    print(f"Overall match rate: {len(valid_data)/isccp_data.size*100:.2f}%")
     
     if len(valid_data) > 0:
-        print(f"ISCCP data range: {valid_data.min():.2f} to {valid_data.max():.2f}")
-        print(f"ISCCP data mean: {valid_data.mean():.2f}")
-        print(f"ISCCP data std: {valid_data.std():.2f}")
-    
-    # Show distribution by trajectory step
-    print(f"\nValid matches by trajectory step:")
-    for step in range(min(10, ds_colocated.dims['step'])):  # Show first 10 steps
-        step_data = isccp_data[:, step].values
-        valid_count = np.sum(~np.isnan(step_data))
-        total_count = np.sum(~np.isnan(ds_colocated.lon[:, step].values))
-        if total_count > 0:
-            print(f"  Step {step}: {valid_count}/{total_count} ({valid_count/total_count*100:.1f}%)")
-    
-    return ds_colocated
-#%%
+        print(f"ISCCP data range: {valid_data.min():.3f} to {valid_data.max():.3f}")
+        print(f"Mean ± std: {valid_data.mean():.3f} ± {valid_data.std():.3f}")
 
+#%%
 # Example usage
 if __name__ == "__main__":
-    # Define file paths
-    trajectory_file = "/disk1/Users/gjp23/outputs/traj_positions/global_analysis/trajectories_20160101_20160102.nc"
-    output_file = "/disk1/Users/gjp23/outputs/traj_positions/global_analysis/trajectories_isccp_colocated_20160101_20160102.nc"
+    # Configuration for 16M trajectories
+    trajectory_file = "/disk1/Users/gjp23/outputs/traj_positions/global_analysis/trajectories_20150101_20160101.nc"
+    output_file = "/disk1/Users/gjp23/outputs/traj_positions/global_analysis/trajectories_isccp_optimized_20150101_20160101.nc"
     
-    ds_colocated = colocate_trajectories_with_isccp_utc_loop(
-            trajectories_file=trajectory_file,
-            collection='isccp-basic',
-            product='hgg',
-            varname='cldamt_irtypes',  # 
-            dt_step_minutes=30
-        )
-    
-    # Analyze and save results
-    analyze_colocated_data(ds_colocated, output_file)
-    
-    # Example: Extract data for trajectories that have good ISCCP coverage
-    valid_matches = np.sum(~np.isnan(ds_colocated.isccp_data.values), axis=1)
-    good_trajectories = np.where(valid_matches >= 10)[0]  # trajectories with at least 10 matches
-    
-    print(f"\nFound {len(good_trajectories)} trajectories with >= 10 ISCCP matches")
-    if len(good_trajectories) > 0:
-        print(f"Example trajectory {good_trajectories[0]}:")
-        traj_data = ds_colocated.isel(trajectory=good_trajectories[0])
-        valid_points = ~np.isnan(traj_data.isccp_data.values)
-        print(f"  Start time: {traj_data.start_time.values}")
-        print(f"  ISCCP matches: {np.sum(valid_points)}")
-        print(f"  ISCCP values: {traj_data.isccp_data.values[valid_points][:5]}...")  # First 5 values
+    # configure for system
 
+    chunk_size = 80000  # Process 100k trajectories at a time
+    n_workers = 12       
+    try:
+        ds_result = run_optimized_colocation(
+            trajectory_file=trajectory_file,
+            output_file=output_file,
+            chunk_size=chunk_size,
+            n_workers=n_workers
+        )
+        
+        print("\nOptimized colocation complete!")
+        
+    except Exception as e:
+        print(f"Error in optimized colocation: {e}")
+        raise
 # %%
