@@ -1,3 +1,4 @@
+#%%
 import numpy as np
 import datetime as dt
 import xarray as xr
@@ -6,6 +7,7 @@ from csat2 import ECMWF
 import warnings
 import os
 from collections import defaultdict
+import pandas as pd
 
 # Initial domain
 resolution = 1
@@ -14,8 +16,8 @@ lon_domain = np.arange(0, 360, resolution)
 lon_grid, lat_grid = np.meshgrid(lon_domain, lat_domain)
 
 # Time parameters
-t0 = dt.datetime(2015, 1, 1, 0, 0)
-tf = dt.datetime(2016, 1, 1, 0, 0)
+t0 = dt.datetime(2007, 1, 1, 0, 0)
+tf = dt.datetime(2017, 1, 1, 0, 0)
 dt_step = dt.timedelta(minutes=60)
 lst_threshold = dt_step.total_seconds() / 3600
 
@@ -30,7 +32,7 @@ def calculate_lst(time_utc, lon):
     return np.mod(time_utc.hour + time_utc.minute / 60 + lon / 15, 24)
 
 # Pre-allocate storage - estimate max trajectories needed
-max_trajectories = len(lat_domain) * len(lon_domain) * steps_total // 24  # rough estimate
+max_trajectories = len(lat_domain) * len(lon_domain) * steps_total // 24  # rough estimate since 
 trajectory_positions = np.full((max_trajectories, steps_per_traj + 1, 2), np.nan)  # [traj, step, lon/lat]
 trajectory_start_times = np.full(max_trajectories, dt.datetime(1900, 1, 1), dtype='datetime64[s]')
 trajectory_count = 0
@@ -38,6 +40,7 @@ trajectory_count = 0
 # Use deque for better performance with active parcels
 from collections import deque
 active_parcels = deque()
+#%%
 
 # Main loop
 for step in range(steps_total):
@@ -51,6 +54,7 @@ for step in range(steps_total):
     if np.any(init_mask):
         init_lons = lon_grid[init_mask].flatten()
         init_lats = lat_grid[init_mask].flatten()
+        print(init_lons.min(),init_lons.max(),init_lats.min(),init_lats.max())
         
         n_new_traj = len(init_lons)
         if trajectory_count + n_new_traj > max_trajectories:
@@ -160,11 +164,11 @@ trajectory_positions = trajectory_positions[:trajectory_count]
 trajectory_start_times = trajectory_start_times[:trajectory_count]
 
 # Create time coordinates
-start_times_dt = [dt.datetime.utctimetuple(t.astype('datetime64[s]').astype(dt.datetime)) for t in trajectory_start_times]
+start_times_dt = [t.astype('datetime64[s]').astype(dt.datetime) for t in trajectory_start_times]
 times_2d = np.array([
-    pd.date_range(start=start, periods=steps_per_traj + 1, freq=dt_step) 
+    [start + i * dt_step for i in range(steps_per_traj + 1)]
     for start in start_times_dt
-])
+], dtype='datetime64[s]')
 
 # Build xarray Dataset
 ds = xr.Dataset(
@@ -184,4 +188,6 @@ ds = xr.Dataset(
 output_dir = "/disk1/Users/gjp23/outputs/traj_positions/global_analysis"
 output_path = os.path.join(output_dir, f"trajectories_{t0:%Y%m%d}_{tf:%Y%m%d}.nc")
 ds.to_netcdf(output_path)
-print(f"Saved {output_path}")
+print(f"Saved {output_path}")# %%
+
+# %%

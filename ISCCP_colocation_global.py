@@ -1,5 +1,4 @@
 #%%
-
 import numpy as np
 import xarray as xr
 from datetime import datetime, timedelta
@@ -17,19 +16,17 @@ import warnings
 class OptimizedTrajectoryColocation:
     """
     parallelized trajectory-ISCCP colocation 
-    
-
     """
     
-    def __init__(self, trajectory_file, chunk_size=100000, n_workers=None):
+    def __init__(self, trajectory_file, chunk_size=100000, n_workers=None, debug=False):
 
         self.trajectory_file = trajectory_file
         self.chunk_size = chunk_size
         self.n_workers = n_workers or max(1, mp.cpu_count() - 1)
+        self.debug = debug
         
-        print(f"Initializing with chunk_size={chunk_size:,}, n_workers={self.n_workers}")
+        print(f"Initializing with chunk_size={chunk_size:,}, n_workers={self.n_workers}, debug={self.debug}")
         
-     
         with xr.open_dataset(trajectory_file) as ds:
             self.n_trajectories = len(ds.trajectory)
             self.n_steps = len(ds.step)
@@ -37,7 +34,6 @@ class OptimizedTrajectoryColocation:
             
         print(f"Dataset: {self.n_trajectories:,} trajectories × {self.n_steps} steps")
         
- 
         self.time_lookup = self._build_time_lookup_table()
         
     def _build_time_lookup_table(self):
@@ -67,13 +63,11 @@ class OptimizedTrajectoryColocation:
         lookup = {}
         
         for i, isccp_time in enumerate(isccp_times):
-            # Find trajectories active at this time (within 24h of start)
             time_since_start = (isccp_time - start_times_dt).total_seconds() / 3600  # hours
             active_mask = (time_since_start >= 0) & (time_since_start <= 24)
             active_traj_indices = np.where(active_mask)[0]
             
             if len(active_traj_indices) > 0:
-                # For each active trajectory, determine the closest time step
                 step_indices = np.round(time_since_start[active_mask]).astype(int)
                 step_indices = np.clip(step_indices, 0, self.n_steps - 1)
                 
@@ -90,10 +84,7 @@ class OptimizedTrajectoryColocation:
         return lookup
     
     def process_isccp_time_chunk(self, isccp_time, traj_chunk_start, traj_chunk_end):
-        """
-        Process a single ISCCP time for a chunk of trajectories.
-        This function can be parallelized.
-        """
+        """Process a single ISCCP time for a chunk of trajectories."""
         if isccp_time not in self.time_lookup:
             return None, None, None  # No active trajectories for this time
         
@@ -106,25 +97,23 @@ class OptimizedTrajectoryColocation:
         if not np.any(chunk_mask):
             return None, None, None
         
-        chunk_traj_indices = active_traj_indices[chunk_mask] - traj_chunk_start  # Relative to chunk
+        chunk_traj_indices = active_traj_indices[chunk_mask] - traj_chunk_start
         chunk_step_indices = step_indices[chunk_mask]
-        global_traj_indices = active_traj_indices[chunk_mask]  # Global indices
+        global_traj_indices = active_traj_indices[chunk_mask]
         
         # Load trajectory chunk
         with xr.open_dataset(self.trajectory_file) as ds:
             chunk_lons = ds.lon.isel(trajectory=slice(traj_chunk_start, traj_chunk_end)).values
             chunk_lats = ds.lat.isel(trajectory=slice(traj_chunk_start, traj_chunk_end)).values
         
-        # Extract positions for active parcels
         lons = chunk_lons[chunk_traj_indices, chunk_step_indices]
         lats = chunk_lats[chunk_traj_indices, chunk_step_indices]
         
-        # Filter out NaN positions
         valid_mask = ~np.isnan(lons) & ~np.isnan(lats)
         if not np.any(valid_mask):
             return None, None, None
         
-        lons = lons[valid_mask] % 360  # Ensure [0, 360]
+        lons = lons[valid_mask] % 360
         lats = lats[valid_mask]
         valid_global_traj = global_traj_indices[valid_mask]
         valid_steps = chunk_step_indices[valid_mask]
@@ -133,16 +122,13 @@ class OptimizedTrajectoryColocation:
     
     def colocate_isccp_time(self, isccp_time, collection='isccp-basic', 
                            product='hgg', varname='cldamt_irtypes'):
-        """
-        Process all trajectory chunks for a single ISCCP time.
-        """
+        """Process all trajectory chunks for a single ISCCP time."""
         print(f"\nProcessing ISCCP time: {isccp_time}")
         
         if isccp_time not in self.time_lookup:
             print("  No active trajectories")
             return {}
         
-        # Load ISCCP data once
         try:
             doy = isccp_time.timetuple().tm_yday
             granule = Granule(isccp_time.year, doy, isccp_time.hour)
@@ -154,9 +140,7 @@ class OptimizedTrajectoryColocation:
             print(f"  Error loading ISCCP data: {e}")
             return {}
         
-        # Collect all active parcels across chunks
         all_lons, all_lats, all_indices = [], [], []
-        
         n_chunks = (self.n_trajectories + self.chunk_size - 1) // self.chunk_size
         
         for chunk_idx in range(n_chunks):
@@ -175,7 +159,6 @@ class OptimizedTrajectoryColocation:
             print("  No valid parcels found")
             return {}
         
-        # Concatenate all parcels
         final_lons = np.concatenate(all_lons)
         final_lats = np.concatenate(all_lats)
         final_traj_indices = np.concatenate([idx[0] for idx in all_indices])
@@ -184,13 +167,11 @@ class OptimizedTrajectoryColocation:
         print(f"  Colocating {len(final_lons):,} parcels...")
         
         try:
-            # Colocate with ISCCP (this is the expensive operation)
             isccp_values = granule.geolocate(collection, product, varname, final_lons, final_lats)
             
             if 'cloud_irtype' in isccp_values.dims:
                 isccp_values = isccp_values.isel(cloud_irtype=0).squeeze()
             
-            # Return results as dictionary for easy merging
             results = {}
             for i, (traj_idx, step_idx) in enumerate(zip(final_traj_indices, final_step_indices)):
                 key = (int(traj_idx), int(step_idx))
@@ -206,19 +187,18 @@ class OptimizedTrajectoryColocation:
     
     def run_parallel_colocation(self, collection='isccp-basic', product='hgg', 
                                varname='cldamt_irtypes', output_file=None):
-        """
-        Run colocation using parallel processing across ISCCP times.
-        """
+        """Run colocation using parallel processing across ISCCP times."""
         print(f"\n{'='*60}")
         print(f"STARTING PARALLEL COLOCATION")
         print(f"{'='*60}")
         
         isccp_times = list(self.time_lookup.keys())
-        # Only take the first 2 ISCCP time slots
-        isccp_times = list(self.time_lookup.keys())[:2] ## this is purely for testing!
+        if self.debug:
+            isccp_times = isccp_times[:2]
+            print(f"[DEBUG MODE] Restricting to {len(isccp_times)} ISCCP time slots")
+        
         print(f"Processing {len(isccp_times)} ISCCP time slots using {self.n_workers} workers")
         
-        # Initialize output array (memory mapped for efficiency)
         if output_file:
             temp_file = output_file.replace('.nc', '_temp.dat')
             isccp_data = np.memmap(temp_file, dtype='float32', mode='w+', 
@@ -227,25 +207,20 @@ class OptimizedTrajectoryColocation:
         else:
             isccp_data = np.full((self.n_trajectories, self.n_steps), np.nan, dtype=np.float32)
         
-        # Process ISCCP times in parallel
         colocation_func = partial(self.colocate_isccp_time, 
                                  collection=collection, product=product, varname=varname)
         
         completed = 0
         with ProcessPoolExecutor(max_workers=self.n_workers) as executor:
-            # Submit all tasks
             future_to_time = {executor.submit(colocation_func, time): time 
                              for time in isccp_times}
             
-            # Collect results as they complete
             for future in as_completed(future_to_time):
                 isccp_time = future_to_time[future]
                 completed += 1
                 
                 try:
                     results = future.result()
-                    
-                    # Store results in output array
                     for (traj_idx, step_idx), value in results.items():
                         isccp_data[traj_idx, step_idx] = value
                     
@@ -259,14 +234,20 @@ class OptimizedTrajectoryColocation:
         print(f"COLOCATION COMPLETE")
         print(f"{'='*60}")
         
-        # Create output dataset
         ds_output = self._create_output_dataset(isccp_data, collection, product, varname)
         
         if output_file:
             print(f"Saving results to {output_file}")
-            ds_output.to_netcdf(output_file, chunks={'trajectory': self.chunk_size})
+            if self.debug:
+                ds_output.to_netcdf(output_file)
+            else:
+                encoding = {
+                    'isccp_data': {'chunksizes': (self.chunk_size, self.n_steps)},
+                    'lon': {'chunksizes': (self.chunk_size, self.n_steps)},
+                    'lat': {'chunksizes': (self.chunk_size, self.n_steps)}
+                }
+                ds_output.to_netcdf(output_file, encoding=encoding)
             
-            # Clean up memory mapped file
             if isinstance(isccp_data, np.memmap):
                 del isccp_data
                 if os.path.exists(temp_file):
@@ -276,8 +257,6 @@ class OptimizedTrajectoryColocation:
     
     def _create_output_dataset(self, isccp_data, collection, product, varname):
         """Create the final output dataset."""
-        
-        # Load trajectory coordinates (chunked)
         with xr.open_dataset(self.trajectory_file, chunks={'trajectory': self.chunk_size}) as ds_traj:
             ds_output = xr.Dataset(
                 data_vars=dict(
@@ -297,11 +276,11 @@ class OptimizedTrajectoryColocation:
                     description=f"Optimized trajectory-ISCCP colocation",
                     n_trajectories=self.n_trajectories,
                     chunk_size=self.chunk_size,
-                    n_workers=self.n_workers
+                    n_workers=self.n_workers,
+                    debug_mode=self.debug
                 )
             )
         
-        # Add variable attributes
         ds_output.isccp_data.attrs = {
             'long_name': f'ISCCP {varname}',
             'source': 'ISCCP',
@@ -314,29 +293,29 @@ class OptimizedTrajectoryColocation:
 def run_optimized_colocation(trajectory_file, output_file, 
                            chunk_size=50000, n_workers=None,
                            collection='isccp-basic', product='hgg', 
-                           varname='cldamt_irtypes'):
+                           varname='cldamt_irtypes', debug=False):
     """
     Main function to run optimized trajectory-ISCCP colocation.
-    
-    Memory usage estimate:
-    - chunk_size=50,000: ~12GB peak memory per worker
-    - chunk_size=100,000: ~24GB peak memory per worker
     """
+    if debug:
+        # Avoid overwriting big outputs by accident
+        base, ext = os.path.splitext(output_file)
+        output_file = f"{base}_debug{ext}"
     
     print(f"Starting optimized colocation:")
     print(f"  Input: {trajectory_file}")
     print(f"  Output: {output_file}")
     print(f"  Chunk size: {chunk_size:,}")
     print(f"  Workers: {n_workers or 'auto'}")
+    print(f"  Debug: {debug}")
     
-    # Initialize colocation processor
     processor = OptimizedTrajectoryColocation(
         trajectory_file=trajectory_file,
         chunk_size=chunk_size,
-        n_workers=n_workers
+        n_workers=n_workers,
+        debug=debug
     )
     
-    # Run parallel colocation
     ds_output = processor.run_parallel_colocation(
         collection=collection,
         product=product,
@@ -344,15 +323,12 @@ def run_optimized_colocation(trajectory_file, output_file,
         output_file=output_file
     )
     
-    # Analyze results
     analyze_colocation_results(ds_output)
-    
     return ds_output
 
 
 def analyze_colocation_results(ds):
     """Quick analysis of colocation results."""
-    
     isccp_data = ds.isccp_data.values
     valid_data = isccp_data[~np.isnan(isccp_data)]
     
@@ -368,22 +344,20 @@ def analyze_colocation_results(ds):
         print(f"Mean ± std: {valid_data.mean():.3f} ± {valid_data.std():.3f}")
 
 #%%
-# Example usage
 if __name__ == "__main__":
-    # Configuration for 16M trajectories
     trajectory_file = "/disk1/Users/gjp23/outputs/traj_positions/global_analysis/trajectories_20150101_20160101.nc"
     output_file = "/disk1/Users/gjp23/outputs/traj_positions/global_analysis/trajectories_isccp_optimized_20150101_20160101.nc"
     
-    # configure for system
-
-    chunk_size = 80000  # Process 100k trajectories at a time
-    n_workers = 12       
+    chunk_size = 100000
+    n_workers = 12
+    
     try:
         ds_result = run_optimized_colocation(
             trajectory_file=trajectory_file,
             output_file=output_file,
             chunk_size=chunk_size,
-            n_workers=n_workers
+            n_workers=n_workers,
+            debug=True  # 🚨 only first 2 ISCCP slots + unchunked output
         )
         
         print("\nOptimized colocation complete!")
