@@ -7,7 +7,8 @@ import cartopy.crs as ccrs
 import pandas as pd
 import scipy.stats
 import cartopy.feature as cfeature
-
+from scipy import stats
+from collections import defaultdict
 import csat2.MODIS
 import seaborn as sns
 
@@ -45,7 +46,7 @@ def create_global_cf_change_grids_enhanced(ds, grid_resolution=1.0):
     """
     
     # Calculate day and night cloud fraction changes for all trajectories
-    isccp_avg_am_one = ds['isccp_data'].isel(step=slice(0, 3)).mean(dim='step', skipna=True)
+    isccp_avg_am_one = ds['isccp_data'].isel(step=slice(0, 3)).mean(dim='step', skipna=True) ## AM first 3 steps, 0,1,2 such that we are guaranteed to get an ISCCP overpass
     lon_avg_am_one = ds['lon'].isel(step=0)
     lat_avg_am_one = ds['lat'].isel(step=0)
 
@@ -121,7 +122,7 @@ def create_global_cf_change_grids_enhanced(ds, grid_resolution=1.0):
 def grid_trajectory_data_enhanced(lons, lats, delta_day, delta_night, 
                                 init_day, init_night, lon_grid, lat_grid):
     """
-    Enhanced version that grids both changes and initial values.
+    Grids both changes and initial values.
     """
     
     # Initialize output grids
@@ -357,7 +358,7 @@ def create_5degree_histogram_analysis(matched_data,
                     init_day_val = np.asarray(init_day[i, j]).item()
                     init_night_val = np.asarray(init_night[i, j]).item()
                 except Exception as e:
-                    # Debug: print shapes to understand the issue
+                    # Debug: print shapes
                     print(f"Error at position ({i}, {j}):")
                     print(f"  delta_day shape: {np.asarray(delta_day[i, j]).shape}")
                     print(f"  delta_night shape: {np.asarray(delta_night[i, j]).shape}")
@@ -1307,3 +1308,31 @@ def example_usage():
     pass
 
 
+
+# %%
+
+if __name__ == "__main__":
+    print("Cloud Fraction - Droplet Concentration Analysis")
+    print("=============================================")
+    print("This code performs comprehensive analysis of how cloud fraction changes")
+    print("depend on droplet number concentration, accounting for initial cloud fraction.")
+    print()
+    print("Key steps:")
+    print("1. Process trajectory data to calculate CF changes")
+    print("2. Match with MODIS droplet concentration data")
+    print("3. Create 5-degree spatial bins with 2D histograms")
+    print("4. Calculate adjusted CF changes (removing initial CF dependence)")
+    print("5. For each spatial location, calculate mean adjusted CF change per Nd bin")
+    print("6. Perform linear regression: mean_adj_CF_change vs log10(Nd)")
+    print("7. Create global maps of regression slopes (aerosol-cloud sensitivity)")
+    print()
+    print("To use: results = run_complete_analysis_with_regression(your_dataset)")
+    print("The regression slopes show how sensitive clouds are to aerosols at each location.")
+    
+    # Uncomment to run with actual data:
+    path_to_file = '/disk1/Users/gjp23/outputs/traj_positions/global_analysis/trajectories_isccp_optimized_20150101_20160101.nc'
+
+    ds = xr.open_dataset(path_to_file)
+    results = run_complete_analysis_with_regression(ds, satellite='terra')
+
+# %%
